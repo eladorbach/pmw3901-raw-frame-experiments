@@ -1,0 +1,314 @@
+diff --git a/src/config/config.h b/src/config/config.h
+index 32a73b6a..9b2757a7 100644
+--- a/src/config/config.h
++++ b/src/config/config.h
+@@ -191,7 +191,7 @@
+ #define UART_RX_TASK_STACKSIZE          configMINIMAL_STACK_SIZE
+ #define ZRANGER_TASK_STACKSIZE          (2 * configMINIMAL_STACK_SIZE)
+ #define ZRANGER2_TASK_STACKSIZE         (2 * configMINIMAL_STACK_SIZE)
+-#define FLOW_TASK_STACKSIZE             (2 * configMINIMAL_STACK_SIZE)
++#define FLOW_TASK_STACKSIZE             (4 * configMINIMAL_STACK_SIZE)
+ #define USDLOG_TASK_STACKSIZE           (2 * configMINIMAL_STACK_SIZE)
+ #define USDWRITE_TASK_STACKSIZE         (3 * configMINIMAL_STACK_SIZE)
+ #define PCA9685_TASK_STACKSIZE          (2 * configMINIMAL_STACK_SIZE)
+diff --git a/src/deck/api/deck_spi.c b/src/deck/api/deck_spi.c
+index 214b7461..41944b7c 100644
+--- a/src/deck/api/deck_spi.c
++++ b/src/deck/api/deck_spi.c
+@@ -261,6 +261,25 @@ bool spiExchange(size_t length, const uint8_t * data_tx, uint8_t * data_rx)
+   return result;
+ }
+ 
++// Polling SPI transfer for single-byte register access.
++ // Must be called while holding spiBeginTransaction() mutex.
++bool spiExchangeBytePolling(uint8_t tx, uint8_t *rx)
++{
++  uint32_t limit = 100000u;
++  SPI_Cmd(SPI, ENABLE);
++  while (SPI_I2S_GetFlagStatus(SPI, SPI_I2S_FLAG_TXE) == RESET && --limit) {}
++  if (!limit) { SPI_Cmd(SPI, DISABLE); return false; }
++  SPI_I2S_SendData(SPI, tx);
++  limit = 100000u;
++  while (SPI_I2S_GetFlagStatus(SPI, SPI_I2S_FLAG_RXNE) == RESET && --limit) {}
++  if (!limit) { SPI_Cmd(SPI, DISABLE); return false; }
++  *rx = (uint8_t)SPI_I2S_ReceiveData(SPI);
++  limit = 100000u;
++  while (SPI_I2S_GetFlagStatus(SPI, SPI_I2S_FLAG_BSY) != RESET && --limit) {}
++  SPI_Cmd(SPI, DISABLE);
++  return limit != 0u;
++}
++
+ void spiBeginTransaction(uint16_t baudRatePrescaler)
+ {
+   xSemaphoreTake(spiMutex, portMAX_DELAY);
+diff --git a/src/deck/drivers/src/flowdeck_v1v2.c b/src/deck/drivers/src/flowdeck_v1v2.c
+index c0f0a532..af6569f2 100755
+--- a/src/deck/drivers/src/flowdeck_v1v2.c
++++ b/src/deck/drivers/src/flowdeck_v1v2.c
+@@ -21,6 +21,7 @@
+  * along with Foobar.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ /* flowdeck_v1v2.c: Flow deck driver */
++#include "watchdog.h"
+ #include "FreeRTOS.h"
+ #include "task.h"
+ 
+@@ -30,6 +31,8 @@
+ #include "log.h"
+ #include "param.h"
+ #include "pmw3901.h"
++#include "app_channel.h"
++#include <string.h>
+ #include "sleepus.h"
+ 
+ #include "stabilizer_types.h"
+@@ -79,6 +82,96 @@ static float flowStdFixed = 2.0f;
+ #define NCS_PIN DECK_GPIO_IO3
+ 
+ 
++
++/* Bench image stream through existing app channel (CRTP port 13 channel 2).
++ * PXV -> PX! version 1, PX? -> 49 segments followed by CRC32 trailer.
++ * Never install on a flight-ready Crazyflie; remove propellers.
++ */
++static uint8_t benchCameraMode = 0;
++static uint8_t benchFrameId = 0;
++static uint8_t benchPixels[1225];
++extern volatile uint32_t pmwBenchPolls;
++extern volatile uint32_t pmwBenchCaptureUs;
++extern volatile uint16_t pmwBenchQuarterMs[4];
++
++static uint32_t benchCrc32(const uint8_t *bytes, size_t size)
++{
++  uint32_t crc=0xFFFFFFFFu;
++  for (size_t i=0;i<size;i++) {
++    crc ^= bytes[i];
++    for (unsigned bit=0;bit<8;bit++)
++      crc=(crc>>1)^((crc&1u)?0xEDB88320u:0u);
++  }
++  return crc ^ 0xFFFFFFFFu;
++}
++
++static bool benchSend(const uint8_t *buf, size_t size)
++{
++  for (unsigned attempt=0; attempt<40;attempt++) {
++    watchdogReset();
++    if (appchannelSendDataPacket((void *)buf,size)==pdTRUE) {
++      // Throttle CRTP so the USB link and queue can drain between fragments.
++      vTaskDelay(2);
++      return true;
++    }
++    vTaskDelay(2);
++  }
++  return false;
++}
++
++static void benchSendImage(void)
++{
++  watchdogReset();
++  const uint8_t frameId=++benchFrameId;
++  // Isolate one real PMW3901 register access from full frame acquisition.
++  const bool ok=pmw3901CaptureBenchFrame(NCS_PIN,benchPixels);
++  uint8_t data[30]={ 'P','X',frameId,0,49 };
++  if (ok) {
++    for (uint8_t i=0;i<49;i++) {
++      data[3]=i;
++      memcpy(data+5,benchPixels+25u*i,25u);
++      if (!benchSend(data,sizeof(data))) return;
++    }
++  }
++  data[3]=255;
++  data[4]=ok?0:1;
++  // On capture failure, report the failing pixel index (big-endian).
++  if (!ok) { data[5]=benchPixels[0]; data[6]=benchPixels[1]; }
++  const uint32_t crc=ok?benchCrc32(benchPixels,sizeof(benchPixels)):0;
++  if (ok) {
++    data[5]=(uint8_t)crc;
++    data[6]=(uint8_t)(crc>>8);
++    data[7]=(uint8_t)(crc>>16);
++    data[8]=(uint8_t)(crc>>24);
++  }
++  // Trailer bytes 9..16: acquisition microseconds and pixel-ready polls.
++  const uint32_t us = pmwBenchCaptureUs;
++  const uint32_t polls = pmwBenchPolls;
++  for (unsigned j=0;j<4;j++) {
++    data[9+j] = (uint8_t)(us >> (j*8));
++    data[13+j] = (uint8_t)(polls >> (j*8));
++  }
++  for (unsigned j=0;j<4;j++) {
++    data[17+2*j] = (uint8_t)pmwBenchQuarterMs[j];
++    data[18+2*j] = (uint8_t)(pmwBenchQuarterMs[j] >> 8);
++  }
++  benchSend(data,25);
++}
++
++static void benchServiceRequest(void)
++{
++  uint8_t request[30]={0};
++  const size_t len=appchannelReceiveDataPacket(request,sizeof(request),0);
++  if (len!=3||request[0]!='P'||request[1]!='X')return;
++  if (request[2]=='V') {
++    const uint8_t response[4]={'P','X','!',1};
++    benchSend(response,sizeof(response));
++  } else if (request[2]=='?') {
++    benchCameraMode=1;
++    benchSendImage();
++  }
++}
++
+ static void flowdeckTask(void *param)
+ {
+   systemWaitStart();
+@@ -87,6 +180,8 @@ static void flowdeckTask(void *param)
+   while(1) {
+     vTaskDelay(10);
+ 
++    if (isInit2) benchServiceRequest();
++    if (benchCameraMode) continue;
+     pmw3901ReadMotion(NCS_PIN, &currentMotion);
+ 
+     // Flip motion information to comply with sensor mounting
+diff --git a/src/drivers/interface/pmw3901.h b/src/drivers/interface/pmw3901.h
+index 18c06631..049a69f3 100644
+--- a/src/drivers/interface/pmw3901.h
++++ b/src/drivers/interface/pmw3901.h
+@@ -74,4 +74,10 @@ bool pmw3901Init(const deckPin_t csPin);
+ void pmw3901ReadMotion(const deckPin_t csPin, motionBurst_t * motion);
+ 
+ 
++
++/* Experimental bench-only 35x35 frame acquisition. Not flight-safe.
++ * The PMW3901 remains in image mode until the board is power-cycled.
++ */
++bool pmw3901CaptureBenchFrame(const deckPin_t csPin, uint8_t pixels[1225]);
++
+ #endif /* PMW3901_H_ */
+diff --git a/src/drivers/src/pmw3901.c b/src/drivers/src/pmw3901.c
+index 768c0760..05a76939 100644
+--- a/src/drivers/src/pmw3901.c
++++ b/src/drivers/src/pmw3901.c
+@@ -33,12 +33,16 @@
+ #include "log.h"
+ #include "param.h"
+ #include "sleepus.h"
++#include "usec_time.h"
++#include "watchdog.h"
++#include <stddef.h>
+ 
+ 
+ static bool isInit = false;
+ 
+ static void registerWrite(const deckPin_t csPin, uint8_t reg, uint8_t value)
+ {
++  watchdogReset();
+   // Set MSB to 1 for write
+   reg |= 0x80u;
+ 
+@@ -58,8 +62,27 @@ static void registerWrite(const deckPin_t csPin, uint8_t reg, uint8_t value)
+   sleepus(200);
+ }
+ 
++extern bool spiExchangeBytePolling(uint8_t tx, uint8_t *rx);
++static uint8_t benchRegisterReadFast(const deckPin_t csPin, uint8_t reg)
++{
++  uint8_t data = 0, discard = 0;
++  watchdogReset();
++  spiBeginTransaction(SPI_BAUDRATE_2MHZ);
++  digitalWrite(csPin, LOW);
++  sleepus(50);
++  bool ok = spiExchangeBytePolling(reg & 0x7fu, &discard);
++  sleepus(50);
++  if (ok) ok = spiExchangeBytePolling(0, &data);
++  sleepus(100);
++  digitalWrite(csPin, HIGH);
++  spiEndTransaction();
++  sleepus(0);
++  return ok ? data : 0xffu;
++}
++
+ static uint8_t registerRead(const deckPin_t csPin, uint8_t reg)
+ {
++  watchdogReset();
+   uint8_t data = 0;
+   uint8_t dummy = 0;
+ 
+@@ -215,6 +238,79 @@ bool pmw3901Init(const deckPin_t csPin)
+   return isInit;
+ }
+ 
++
++/* PMW3901 bench camera mode based on Bitcraze's publicly released framebuffer
++ * register sequence. Every busy wait has a monotonic deadline.
++ * Mode transition is one-way: power cycle to resume optical-flow tracking.
++ */
++static bool benchFrameMode = false;
++volatile uint32_t pmwBenchPolls = 0;
++volatile uint32_t pmwBenchCaptureUs = 0;
++volatile uint16_t pmwBenchQuarterMs[4] = {0};
++static bool benchWaitReady(const deckPin_t csPin, const uint64_t deadline)
++{
++  unsigned polls = 0;
++  while (usecTimestamp() < deadline) {
++    if ((registerRead(csPin, 0x58) >> 6) != 3) return true;
++    if (++polls % 8u == 0u) { watchdogReset(); vTaskDelay(1); }
++  }
++  return false;
++}
++
++bool pmw3901CaptureBenchFrame(const deckPin_t csPin, uint8_t pixels[1225])
++{
++
++  if (!isInit || pixels == NULL) return false;
++  const uint64_t captureStart = usecTimestamp();
++  pmwBenchPolls = 0;
++  const uint64_t deadline = captureStart + 30000000ULL;
++  if (!benchFrameMode) {
++    registerWrite(csPin, 0x7F, 0x07);
++    registerWrite(csPin, 0x41, 0x1D);
++    registerWrite(csPin, 0x4C, 0x00);
++    registerWrite(csPin, 0x7F, 0x08);
++    registerWrite(csPin, 0x6A, 0x38);
++    registerWrite(csPin, 0x7F, 0x00);
++    registerWrite(csPin, 0x55, 0x04);
++    registerWrite(csPin, 0x40, 0x80);
++    registerWrite(csPin, 0x4D, 0x11);
++    registerWrite(csPin, 0x70, 0x00);
++    registerWrite(csPin, 0x58, 0xFF);
++    benchFrameMode = true; /* frame mode remains enabled after a failed capture */
++    if (!benchWaitReady(csPin, deadline)) { pixels[0]=0xFE; pixels[1]=0; return false; }
++    sleepus(50);
++  }
++
++  for (unsigned i=0; i<1225; i++) {
++    uint8_t a = 0;
++    bool found = false;
++    unsigned polls = 0;
++    const uint64_t pixelDeadline = usecTimestamp() + 250000ULL;
++    while (usecTimestamp() < deadline && usecTimestamp() < pixelDeadline) {
++      a = benchRegisterReadFast(csPin, 0x58);
++      pmwBenchPolls++;
++      if ((a >> 6) == 1) {found=true;break;}
++      // Do not starve the USB/CRTP and system tasks when a pixel is unavailable.
++      if (++polls % 8u == 0u) { watchdogReset(); vTaskDelay(1); }
++    }
++    if (!found) { pixels[0]=(uint8_t)(i>>8); pixels[1]=(uint8_t)i; return false; }
++    watchdogReset();
++    if ((i & 15u) == 15u) vTaskDelay(1);
++    const uint8_t b = benchRegisterReadFast(csPin, 0x58);
++    pixels[i] = (uint8_t)((a << 2) | (b & 0x0C));
++    if (i == 305u || i == 611u || i == 917u || i == 1224u) {
++      const unsigned q = i == 305u ? 0u : i == 611u ? 1u : i == 917u ? 2u : 3u;
++      pmwBenchQuarterMs[q] = (uint16_t)((usecTimestamp() - captureStart) / 1000u);
++    }
++  }
++  watchdogReset();
++  registerWrite(csPin, 0x70, 0x00);
++  registerWrite(csPin, 0x58, 0xFF);
++  if (!benchWaitReady(csPin, deadline)) { pixels[0]=0xFD; pixels[1]=0; return false; }
++  pmwBenchCaptureUs = (uint32_t)(usecTimestamp() - captureStart);
++  return true;
++}
++
+ void pmw3901ReadMotion(const deckPin_t csPin, motionBurst_t * motion)
+ {
+   uint8_t address = 0x16;
