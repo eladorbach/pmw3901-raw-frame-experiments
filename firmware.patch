@@ -19,7 +19,7 @@ index 214b7461..41944b7c 100644
    return result;
  }
  
-+// Polling SPI transfer for single-byte register access.
++// Single-byte SPI register transfer.
 + // Must be called while holding spiBeginTransaction() mutex.
 +bool spiExchangeBytePolling(uint8_t tx, uint8_t *rx)
 +{
@@ -67,7 +67,7 @@ index c0f0a532..af6569f2 100755
  
  
 +
-+/* Bench image stream through existing app channel (CRTP port 13 channel 2).
++/* PMW3901 image transfer over CRTP port 13, channel 2.
 + * PXV -> PX! version 1, PX? -> 49 segments followed by CRC32 trailer.
 + * Never install on a flight-ready Crazyflie; remove propellers.
 + */
@@ -94,7 +94,7 @@ index c0f0a532..af6569f2 100755
 +  for (unsigned attempt=0; attempt<40;attempt++) {
 +    watchdogReset();
 +    if (appchannelSendDataPacket((void *)buf,size)==pdTRUE) {
-+      // Throttle CRTP so the USB link and queue can drain between fragments.
++      // Allow the CRTP queue to drain.
 +      vTaskDelay(2);
 +      return true;
 +    }
@@ -107,7 +107,7 @@ index c0f0a532..af6569f2 100755
 +{
 +  watchdogReset();
 +  const uint8_t frameId=++benchFrameId;
-+  // Isolate one real PMW3901 register access from full frame acquisition.
++  // Read a single PMW3901 register.
 +  const bool ok=pmw3901CaptureBenchFrame(NCS_PIN,benchPixels);
 +  uint8_t data[30]={ 'P','X',frameId,0,49 };
 +  if (ok) {
@@ -119,7 +119,7 @@ index c0f0a532..af6569f2 100755
 +  }
 +  data[3]=255;
 +  data[4]=ok?0:1;
-+  // On capture failure, report the failing pixel index (big-endian).
++  // Failed pixel index, big-endian.
 +  if (!ok) { data[5]=benchPixels[0]; data[6]=benchPixels[1]; }
 +  const uint32_t crc=ok?benchCrc32(benchPixels,sizeof(benchPixels)):0;
 +  if (ok) {
@@ -128,7 +128,7 @@ index c0f0a532..af6569f2 100755
 +    data[7]=(uint8_t)(crc>>16);
 +    data[8]=(uint8_t)(crc>>24);
 +  }
-+  // Trailer bytes 9..16: acquisition microseconds and pixel-ready polls.
++  // Trailer bytes 9..16: acquisition time and ready-poll count.
 +  const uint32_t us = pmwBenchCaptureUs;
 +  const uint32_t polls = pmwBenchPolls;
 +  for (unsigned j=0;j<4;j++) {
@@ -177,7 +177,7 @@ index 18c06631..049a69f3 100644
  
  
 +
-+/* Experimental bench-only 35x35 frame acquisition. Not flight-safe.
++/* PMW3901 35x35 bench frame capture. Not flight-safe.
 + * The PMW3901 remains in image mode until the board is power-cycled.
 + */
 +bool pmw3901CaptureBenchFrame(const deckPin_t csPin, uint8_t pixels[1225]);
@@ -237,7 +237,7 @@ index 768c0760..05a76939 100644
  }
  
 +
-+/* PMW3901 bench camera mode based on Bitcraze's publicly released framebuffer
++/* PMW3901 frame capture registers from the Bitcraze framebuffer
 + * register sequence. Every busy wait has a monotonic deadline.
 + * Mode transition is one-way: power cycle to resume optical-flow tracking.
 + */
@@ -288,7 +288,7 @@ index 768c0760..05a76939 100644
 +      a = benchRegisterReadFast(csPin, 0x58);
 +      pmwBenchPolls++;
 +      if ((a >> 6) == 1) {found=true;break;}
-+      // Do not starve the USB/CRTP and system tasks when a pixel is unavailable.
++      // Yield while waiting for pixel data.
 +      if (++polls % 8u == 0u) { watchdogReset(); vTaskDelay(1); }
 +    }
 +    if (!found) { pixels[0]=(uint8_t)(i>>8); pixels[1]=(uint8_t)i; return false; }
